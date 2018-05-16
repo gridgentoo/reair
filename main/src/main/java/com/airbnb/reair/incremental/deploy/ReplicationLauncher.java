@@ -16,6 +16,9 @@ import com.airbnb.reair.incremental.db.PersistedJobInfoStore;
 import com.airbnb.reair.incremental.filter.ReplicationFilter;
 import com.airbnb.reair.incremental.thrift.TReplicationService;
 
+import com.timgroup.statsd.NoOpStatsDClient;
+import com.timgroup.statsd.NonBlockingStatsDClient;
+import com.timgroup.statsd.StatsDClient;
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -42,7 +45,7 @@ public class ReplicationLauncher {
       ReplicationLauncher.class);
 
   /**
-   * Launches the replication sever process using the passed in configuration.
+   * Launches the replication server process using the passed in configuration.
    *
    * @param conf configuration object
    * @param startAfterAuditLogId instruct the server to start replicating entries after this ID
@@ -58,7 +61,18 @@ public class ReplicationLauncher {
       boolean resetState)
     throws AuditLogEntryException, ConfigurationException, IOException, StateUpdateException,
       SQLException {
+    // Create statsd registry
+    boolean statsDEnabled = conf.getBoolean(ConfigurationKeys.STATSD_ENABLED, false);
+    StatsDClient statsDClient;
+    if (statsDEnabled) {
+      statsDClient = new NonBlockingStatsDClient(
+          conf.get(ConfigurationKeys.STATSD_PREFIX, "reair"),
+          conf.get(ConfigurationKeys.STATSD_HOST, "localhost"),
+          conf.getInt(ConfigurationKeys.STATSD_PORT, 8125));
 
+    } else {
+      statsDClient = new NoOpStatsDClient();
+    }
 
     // Create the audit log reader
     String auditLogJdbcUrl = conf.get(
@@ -177,6 +191,7 @@ public class ReplicationLauncher {
         persistedJobInfoStore,
         replicationFilters,
         clusterFactory.getDirectoryCopier(),
+        statsDClient,
         numWorkers,
         maxJobsInMemory,
         startAfterAuditLogId);

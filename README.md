@@ -1,4 +1,4 @@
-# ReAir
+# код airbnb : : ReAir : : Архитектура [ReAir] инструмента для  replicating tables and partitions между Hive data warehouses
 
 ReAir is a collection of easy-to-use tools for replicating tables and partitions between Hive data warehouses. These tools are targeted at developers that already have some familiarity with operating warehouses based on Hadoop and Hive.
 

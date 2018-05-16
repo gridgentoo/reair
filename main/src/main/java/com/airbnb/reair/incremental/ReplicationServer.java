@@ -1,5 +1,9 @@
 package com.airbnb.reair.incremental;
 
+import static com.airbnb.reair.incremental.auditlog.MetricNames.AUDIT_LOG_ENTRIES_COUNT;
+import static com.airbnb.reair.incremental.auditlog.MetricNames.JOBS_IN_MEMORY_GAUGE;
+import static com.airbnb.reair.incremental.auditlog.MetricNames.PERSISTED_JOBS_COUNT;
+
 import com.airbnb.reair.common.HiveObjectSpec;
 import com.airbnb.reair.db.DbKeyValueStore;
 import com.airbnb.reair.incremental.auditlog.AuditLogEntry;
@@ -25,6 +29,7 @@ import com.airbnb.reair.incremental.thrift.TReplicationJob;
 import com.airbnb.reair.incremental.thrift.TReplicationService;
 import com.airbnb.reair.multiprocessing.ParallelJobExecutor;
 
+import com.timgroup.statsd.StatsDClient;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -77,11 +82,13 @@ public class ReplicationServer implements TReplicationService.Iface {
   private List<ReplicationFilter> replicationFilters;
 
   // Collect stats with counters
-  private ReplicationCounters counters = new ReplicationCounters();
+  private ReplicationCounters counters;
 
-  private ReplicationJobRegistry jobRegistry = new ReplicationJobRegistry();
+  private ReplicationJobRegistry jobRegistry;
 
   private ReplicationJobFactory jobFactory;
+
+  private StatsDClient statsDClient;
 
   // If the number of jobs that we track in memory exceed this amount, then
   // pause until more jobs finish.
@@ -89,11 +96,13 @@ public class ReplicationServer implements TReplicationService.Iface {
 
   private volatile boolean pauseRequested = false;
 
-  private StatsTracker statsTracker = new StatsTracker(jobRegistry);
+  private StatsTracker statsTracker;
 
   private DirectoryCopier directoryCopier;
 
   private Optional<Long> startAfterAuditLogId = Optional.empty();
+
+  private long replicationJobRegistryReportInterval;
 
   // Responsible for persisting changes to the state of the replication job
   // once it finishes
@@ -165,6 +174,7 @@ public class ReplicationServer implements TReplicationService.Iface {
       final PersistedJobInfoStore jobInfoStore,
       List<ReplicationFilter> replicationFilters,
       DirectoryCopier directoryCopier,
+      StatsDClient statsDClient,
       int numWorkers,
       int maxJobsInMemory,
       Optional<Long> startAfterAuditLogId) {
@@ -174,6 +184,7 @@ public class ReplicationServer implements TReplicationService.Iface {
     this.auditLogReader = auditLogReader;
     this.keyValueStore = keyValueStore;
     this.jobInfoStore = jobInfoStore;
+    this.statsDClient = statsDClient;
 
     this.onStateChangeHandler = new JobStateChangeHandler();
 
@@ -185,11 +196,15 @@ public class ReplicationServer implements TReplicationService.Iface {
     this.replicationFilters = replicationFilters;
 
     this.maxJobsInMemory = maxJobsInMemory;
+    this.counters = new ReplicationCounters(statsDClient);
 
     this.jobExecutor = new ParallelJobExecutor("TaskWorker", numWorkers);
     this.copyPartitionJobExecutor = new ParallelJobExecutor("CopyPartitionWorker", numWorkers);
     this.auditLogBatchSize = conf.getInt(
         ConfigurationKeys.AUDIT_LOG_PROCESSING_BATCH_SIZE, 32);
+
+    this.jobRegistry = new ReplicationJobRegistry(conf, statsDClient);
+    this.statsTracker = new StatsTracker(jobRegistry);
 
     this.directoryCopier = directoryCopier;
 
@@ -204,6 +219,9 @@ public class ReplicationServer implements TReplicationService.Iface {
         copyPartitionJobExecutor,
         directoryCopier);
 
+    this.replicationJobRegistryReportInterval = 1000
+        * conf.getLong(ConfigurationKeys.REPLICATION_JOB_REGISTRY_REPORT_INTERVAL_SEC,
+        60);
 
     this.startAfterAuditLogId = startAfterAuditLogId;
 
@@ -380,6 +398,7 @@ public class ReplicationServer implements TReplicationService.Iface {
     // This is the time that the last persisted id was updated in the store.
     // It's tracked to rate limit the number of updates that are done.
     long updateTimeForLastPersistedId = 0;
+    long lastReportedMetricsTimeReplicationJob = 0;
 
     while (true) {
       if (pauseRequested) {
@@ -387,7 +406,11 @@ public class ReplicationServer implements TReplicationService.Iface {
         ReplicationUtils.sleep(pollWaitTimeMs);
         continue;
       }
-      long batchSize = auditLogBatchSize;
+      if (System.currentTimeMillis() - lastReportedMetricsTimeReplicationJob
+          > replicationJobRegistryReportInterval) {
+        jobRegistry.reportStats();
+        lastReportedMetricsTimeReplicationJob = System.currentTimeMillis();
+      }
 
       // Stop if we've had enough successful jobs - for testing purposes
       // only
@@ -401,6 +424,7 @@ public class ReplicationServer implements TReplicationService.Iface {
         return;
       }
 
+      statsDClient.gauge(JOBS_IN_MEMORY_GAUGE, jobExecutor.getNotDoneJobCount());
       // Wait if there are too many jobs
       if (jobExecutor.getNotDoneJobCount() >= maxJobsInMemory) {
         LOG.debug(String.format(
@@ -410,6 +434,7 @@ public class ReplicationServer implements TReplicationService.Iface {
         continue;
       }
 
+      long batchSize = auditLogBatchSize;
       // make sure not to exceed maxJobsInMemory
       batchSize = Math.min(batchSize, maxJobsInMemory - jobExecutor.getNotDoneJobCount());
 
@@ -418,6 +443,7 @@ public class ReplicationServer implements TReplicationService.Iface {
       List<AuditLogEntry> auditLogEntries = auditLogReader.resilientNext((int) batchSize);
 
       LOG.debug(String.format("Got %d audit log entries", auditLogEntries.size()));
+      statsDClient.count(AUDIT_LOG_ENTRIES_COUNT, auditLogEntries.size());
       for (AuditLogEntry entry : auditLogEntries) {
         LOG.debug("Got audit log entry: " + entry);
       }
@@ -440,6 +466,7 @@ public class ReplicationServer implements TReplicationService.Iface {
         replicationJobsJobsSize += rj.size();
       }
       LOG.debug(String.format("Persisted %d replication jobs", replicationJobsJobsSize));
+      statsDClient.count(PERSISTED_JOBS_COUNT, replicationJobsJobsSize);
       // Since the replication job was created and persisted, we can
       // advance the last persisted ID. Update every 10s to reduce db
 
